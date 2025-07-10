@@ -1,0 +1,1055 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Script de surveillance des capteurs St Musse avec envoi d'emails d'alerte
+VERSION COMPATIBLE OUTLOOK AVEC IDS DES COUCHES
+- 16h00 : Email pour alertes d'ouvertures uniquement (fenêtres/portes)
+- 16h10 : Email pour toutes les alertes (ouvertures + batteries + installation + silencieux + actifs sans données)
+"""
+
+import json
+import logging
+import datetime
+import os
+import time
+import smtplib
+import ssl
+import sys
+from arcgis.gis import GIS
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.utils import formataddr
+
+# ==================== CONFIGURATION ====================
+SCRIPT_NAME = "amir_capteurs_surveillance_emails"
+
+# Configuration des couches à surveiller AVEC IDS
+COUCHES_CONFIG = {
+    "WS301": {
+        "layer_id": "074945c2b3d9434e81c520e4e38b5361",
+        "type_display": "Fenêtres (WS301)"
+    },
+    "PORTES": {
+        "layer_id": "64ab586a71ef4fdb997bc4e0a627b2bd",
+        "type_display": "Portes extérieures"
+    }
+}
+
+# ==================== MODE SIMULATION ====================
+# 🧪 SIMULATION : Mettre True pour tester, False pour production
+SIMULATION_MODE = True  # TODO: Mettre en commentaire ou False pour la production
+
+# Configuration email (même approche robuste que Waze)
+EMAIL_CONFIG = {
+    "server": "smtp.gmail.com",
+    "port": 587,
+    "sender": "amirtpmstmusse@gmail.com",
+    "password": "nkyp cmmy howv dmxv",
+    "recipients": ["amirtpmstmusse@gmail.com", "amir.labidi-ext@metropoletpm.fr",]  # Test uniquement
+    # "recipients": ["amirtpmstmusse@gmail.com", "ahuetdefrobe-ext@metropoletpm.fr", "cjoly@metropoletpm.fr"]  # PRODUCTION
+}
+
+# Configuration des horaires d'envoi
+HORAIRE_EMAIL_OUVERTURES = 19  # 16h00 pour les ouvertures
+HORAIRE_EMAIL_TOUTES_ALERTES = 19  # 16h pour le test, normalement 16h10
+MINUTE_EMAIL_TOUTES_ALERTES = 10
+
+# Fichier de suivi pour éviter les doublons d'emails
+SUIVI_FILE = "capteurs_surveillance_suivi.json"
+
+# ==================== LOGGING ====================
+import sys
+import os
+
+# Forcer l'encodage UTF-8 pour éviter les erreurs avec les emojis (seulement si pas Jupyter)
+if os.name == 'nt' and hasattr(sys.stdout, 'buffer'):  # Windows et pas Jupyter
+    import codecs
+    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
+
+log = logging.getLogger()
+LOG_LEVEL = logging.INFO
+log_file = "capteurs_surveillance.log"
+FORMAT = "%(asctime)-15s - %(levelname)s - %(message)s"
+
+# Configuration du logging adaptée à l'environnement
+try:
+    logging.basicConfig(format=FORMAT, level=LOG_LEVEL, datefmt='%Y-%m-%d %H:%M:%S',
+                       handlers=[
+                           logging.FileHandler(log_file, encoding='utf-8'),  # Encodage UTF-8
+                           logging.StreamHandler()
+                       ])
+except Exception:
+    # Fallback si problème d'encodage
+    logging.basicConfig(format=FORMAT, level=LOG_LEVEL, datefmt='%Y-%m-%d %H:%M:%S',
+                       handlers=[
+                           logging.FileHandler(log_file),
+                           logging.StreamHandler()
+                       ])
+
+# ==================== CLASSES UTILITAIRES ====================
+
+class EmailManager:
+    """Gère l'envoi des emails d'alerte - VERSION COMPATIBLE OUTLOOK"""
+    
+    def __init__(self, config=EMAIL_CONFIG):
+        self.config = config
+    
+    def test_connection(self):
+        """Teste la connexion email"""
+        try:
+            context = ssl.create_default_context()
+            with smtplib.SMTP(self.config['server'], self.config['port']) as server:
+                server.starttls(context=context)
+                server.login(self.config['sender'], self.config['password'])
+                return True
+        except Exception as e:
+            log.error(f"Erreur de connexion email: {str(e)}")
+            return False
+    
+    def send_ouvertures_alert(self, alertes_ouvertures):
+        """Envoie l'email des alertes d'ouvertures (16h00) - VERSION OUTLOOK COMPATIBLE"""
+        
+        # Créer le message
+        msg = MIMEMultipart()
+        msg["From"] = formataddr(("Surveillance Capteurs TPM", self.config['sender']))
+        msg["To"] = ', '.join(self.config['recipients'])
+        msg["Subject"] = f"🧪 [TEST] ALERTES OUVERTURES St Musse - {datetime.datetime.now().strftime('%d/%m/%Y à %H:%M')}" if SIMULATION_MODE else f"🚨 ALERTES OUVERTURES St Musse - {datetime.datetime.now().strftime('%d/%m/%Y à %H:%M')}"
+        
+        # Corps du message HTML - VERSION COMPATIBLE OUTLOOK
+        body_html = f"""
+<html>
+<head>
+    <style>
+        /* Styles compatibles Outlook */
+        body, table, td, th {{ 
+            font-family: Arial, sans-serif !important;
+            margin: 0;
+            padding: 0;
+            line-height: 1.4;
+        }}
+        table {{ 
+            border-collapse: collapse;
+            width: 100%;
+            max-width: 700px;
+            margin: 0 auto;
+        }}
+        .main-table {{
+            background-color: #ffffff;
+            border: 1px solid #e2e8f0;
+        }}
+        .header-row {{
+            background-color: #ffffff;
+            color: #1e40af;
+        }}
+        .header-cell {{
+            padding: 25px 20px;
+            text-align: center;
+            color: #1e40af;
+        }}
+        .header-title {{
+            margin: 0 0 10px 0;
+            font-size: 24px;
+            font-weight: bold;
+            text-transform: uppercase;
+        }}
+        .header-subtitle {{
+            margin: 0 0 12px 0;
+            font-size: 15px;
+            opacity: 0.9;
+        }}
+        .timestamp {{
+            background-color: rgba(30, 64, 175, 0.1);
+            border: 1px solid rgba(30, 64, 175, 0.2);
+            padding: 6px 16px;
+            border-radius: 15px;
+            font-size: 12px;
+            display: inline-block;
+            font-weight: bold;
+        }}
+        .stats-row {{
+            background-color: #ffffff;
+            color: #1e40af;
+        }}
+        .stats-cell {{
+            padding: 18px 20px;
+            text-align: center;
+            color: #1e40af;
+        }}
+        .stats-title {{
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }}
+        .alerte-item {{
+            background-color: #ffffff;
+            border-left: 4px solid #ef4444;
+            padding: 12px;
+            margin: 8px 0;
+            border: 1px solid #e5e7eb;
+        }}
+        .device-name {{
+            font-weight: bold;
+            font-size: 14px;
+            color: #1e293b;
+            margin-bottom: 5px;
+        }}
+        .device-info {{
+            color: #64748b;
+            font-size: 12px;
+        }}
+        .device-type {{
+            background-color: #fef2f2;
+            color: #dc2626;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 10px;
+            font-weight: bold;
+            margin-right: 10px;
+        }}
+        .no-alerts {{
+            text-align: center;
+            padding: 30px 20px;
+            color: #64748b;
+            background-color: #f8fafc;
+        }}
+        .no-alerts-icon {{ 
+            font-size: 32px; 
+            margin-bottom: 8px; 
+        }}
+        .no-alerts-title {{
+            font-size: 16px;
+            font-weight: bold;
+            margin-bottom: 4px;
+            color: #374151;
+        }}
+        .footer-row {{
+            background-color: #ffffff;
+            color: #1e40af;
+        }}
+        .footer-cell {{
+            padding: 12px 20px;
+            text-align: center;
+            font-size: 12px;
+            color: #1e40af;
+        }}
+    </style>
+</head>
+<body>
+    <table class="main-table" cellpadding="0" cellspacing="0">
+        <!-- Header -->
+        <tr class="header-row">
+            <td class="header-cell">
+                <h1 class="header-title">ALERTES D'OUVERTURES - ST MUSSE</h1>
+                <p class="header-subtitle">Surveillance automatique des fenêtres et portes</p>
+                <div class="timestamp">{datetime.datetime.now().strftime('%d/%m/%Y à %H:%M')}</div>
+            </td>
+        </tr>
+        
+        <!-- Stats -->
+        <tr class="stats-row">
+            <td class="stats-cell">
+                <div class="stats-title">
+                    {len(alertes_ouvertures)} capteur(s) avec alerte d'ouverture détectée(s)
+                </div>
+            </td>
+        </tr>
+        
+        <!-- Content -->
+        <tr>
+            <td class="content-cell">
+"""
+        
+        if alertes_ouvertures:
+            body_html += """
+                <h3 style="color: #1e293b; margin-bottom: 15px; font-size: 16px; font-weight: bold;">Détail des alertes:</h3>
+"""
+            
+            for alerte in alertes_ouvertures:
+                date_str = self._format_date(alerte.get('lastUplinkTime'))
+                
+                body_html += f"""
+                <div class="alerte-item">
+                    <div class="device-name">{alerte['code']} - {alerte['title']}</div>
+                    <div class="device-info">
+                        <span class="device-type">{alerte['type_capteur']}</span>
+                        <span style="font-size: 11px; color: #6b7280;">{date_str}</span>
+                    </div>
+                </div>
+"""
+        else:
+            body_html += """
+                <div class="no-alerts">
+                    <div class="no-alerts-icon">✅</div>
+                    <div class="no-alerts-title">Aucune alerte d'ouverture</div>
+                    <div>Tous les capteurs de fenêtres et portes sont fermés</div>
+                </div>
+"""
+        
+        body_html += f"""
+            </td>
+        </tr>
+        
+        <!-- Footer -->
+        <tr class="footer-row">
+            <td class="footer-cell">
+                <strong>ℹ️</strong> Email automatique 16h00 | Un second rapport complet sera envoyé à 16h10 | <em>{SCRIPT_NAME} - St Musse</em>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>
+"""
+        
+        msg.attach(MIMEText(body_html, "html"))
+        
+        return self._send_email(msg, "alertes d'ouvertures")
+    
+    def send_toutes_alertes(self, toutes_alertes):
+        """Envoie l'email de toutes les alertes (16h10) - VERSION OUTLOOK COMPATIBLE"""
+        
+        # Grouper les alertes par type
+        alertes_par_type = {
+            "ouvertures": [],
+            "batteries": [],
+            "installation": [],
+            "silencieux": [],
+            "actifs_sans_donnees": []
+        }
+        
+        for alerte in toutes_alertes:
+            alerte_type = alerte.get('alerte_type', '')
+            if 'fenetre_ouverte_hors_horaire' in alerte_type or 'porte_ouverte_hors_horaire' in alerte_type:
+                alertes_par_type["ouvertures"].append(alerte)
+            if 'batterie_faible' in alerte_type:
+                alertes_par_type["batteries"].append(alerte)
+            if 'capteur_mal_installe' in alerte_type:
+                alertes_par_type["installation"].append(alerte)
+            if 'capteur_silencieux' in alerte_type:
+                alertes_par_type["silencieux"].append(alerte)
+            if 'capteur_actif_sans_donnees' in alerte_type:
+                alertes_par_type["actifs_sans_donnees"].append(alerte)
+        
+        # Créer le message
+        msg = MIMEMultipart()
+        msg["From"] = formataddr(("Surveillance Capteurs TPM", self.config['sender']))
+        msg["To"] = ', '.join(self.config['recipients'])
+        msg["Subject"] = f"🧪 [TEST] RAPPORT COMPLET ALERTES St Musse - {datetime.datetime.now().strftime('%d/%m/%Y à %H:%M')}" if SIMULATION_MODE else f"📋 RAPPORT COMPLET ALERTES St Musse - {datetime.datetime.now().strftime('%d/%m/%Y à %H:%M')}"
+        
+        # Corps du message HTML - VERSION COMPATIBLE OUTLOOK
+        body_html = f"""
+<html>
+<head>
+    <style>
+        /* Styles compatibles Outlook */
+        body, table, td, th {{ 
+            font-family: Arial, sans-serif !important;
+            margin: 0;
+            padding: 0;
+            line-height: 1.4;
+        }}
+        table {{ 
+            border-collapse: collapse;
+            width: 100%;
+            max-width: 700px;
+            margin: 0 auto;
+        }}
+        .main-table {{
+            background-color: #ffffff;
+            border: 1px solid #e2e8f0;
+        }}
+        .header-row {{
+            background-color: #ffffff;
+            color: #1e40af;
+        }}
+        .header-cell {{
+            padding: 25px 20px;
+            text-align: center;
+            color: #1e40af;
+        }}
+        .header-title {{
+            margin: 0 0 10px 0;
+            font-size: 24px;
+            font-weight: bold;
+            text-transform: uppercase;
+        }}
+        .header-subtitle {{
+            margin: 0 0 12px 0;
+            font-size: 15px;
+            opacity: 0.9;
+        }}
+        .timestamp {{
+            background-color: rgba(30, 64, 175, 0.1);
+            border: 1px solid rgba(30, 64, 175, 0.2);
+            padding: 6px 16px;
+            border-radius: 15px;
+            font-size: 12px;
+            display: inline-block;
+            font-weight: bold;
+        }}
+        .stats-row {{
+            background-color: #ffffff;
+            color: #1e40af;
+        }}
+        .stats-cell {{
+            padding: 18px 20px;
+            color: #1e40af;
+        }}
+        .stats-title {{
+            text-align: center;
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 15px;
+        }}
+        .stats-table {{
+            width: 100%;
+            margin: 0 auto;
+        }}
+        .stat-cell {{
+            background-color: #1e40af;
+            border: 1px solid #1e40af;
+            padding: 10px 6px;
+            text-align: center;
+            font-size: 12px;
+            width: 20%;
+        }}
+        .stat-number {{
+            font-size: 20px;
+            font-weight: bold;
+            display: block;
+            line-height: 1;
+            margin-bottom: 4px;
+            color: #ffffff;
+        }}
+        .stat-label {{
+            font-size: 10px;
+            font-weight: bold;
+            text-transform: uppercase;
+            color: #ffffff;
+        }}
+        .content-cell {{
+            padding: 20px;
+            vertical-align: top;
+        }}
+        .section {{
+            margin-bottom: 20px;
+        }}
+        .section-header {{
+            background-color: #1e40af;
+            color: #ffffff;
+            padding: 8px 15px;
+            font-weight: bold;
+            font-size: 14px;
+            margin-bottom: 8px;
+        }}
+        .alerte-item {{
+            background-color: #ffffff;
+            border-left: 4px solid #3b82f6;
+            padding: 12px;
+            margin: 6px 0;
+            border: 1px solid #e5e7eb;
+        }}
+        .alerte-batterie {{
+            background-color: #fef3c7;
+            border-left-color: #f59e0b;
+        }}
+        .alerte-installation {{
+            background-color: #fef2f2;
+            border-left-color: #ef4444;
+        }}
+        .alerte-silencieux {{
+            background-color: #f8fafc;
+            border-left-color: #64748b;
+        }}
+        .alerte-actif {{
+            background-color: #f0f9ff;
+            border-left-color: #0ea5e9;
+        }}
+        .device-name {{
+            font-weight: bold;
+            font-size: 14px;
+            color: #1e293b;
+            margin-bottom: 5px;
+        }}
+        .device-info {{
+            color: #64748b;
+            font-size: 12px;
+        }}
+        .device-type {{
+            background-color: rgba(59, 130, 246, 0.1);
+            color: #2563eb;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 10px;
+            font-weight: bold;
+            margin-right: 10px;
+        }}
+        .no-alerts {{
+            text-align: center;
+            padding: 30px 20px;
+            color: #64748b;
+            background-color: #f8fafc;
+        }}
+        .no-alerts-icon {{ 
+            font-size: 32px; 
+            margin-bottom: 8px; 
+        }}
+        .no-alerts-title {{
+            font-size: 16px;
+            font-weight: bold;
+            margin-bottom: 4px;
+            color: #374151;
+        }}
+        .footer-row {{
+            background-color: #ffffff;
+            color: #1e40af;
+        }}
+        .footer-cell {{
+            padding: 12px 20px;
+            text-align: center;
+            font-size: 12px;
+            color: #1e40af;
+        }}
+    </style>
+</head>
+<body>
+    <table class="main-table" cellpadding="0" cellspacing="0">
+        <!-- Header -->
+        <tr class="header-row">
+            <td class="header-cell">
+                <h1 class="header-title">RAPPORT COMPLET DES ALERTES - ST MUSSE</h1>
+                <p class="header-subtitle">Surveillance automatique complète</p>
+                <div class="timestamp">{datetime.datetime.now().strftime('%d/%m/%Y à %H:%M')}</div>
+            </td>
+        </tr>
+        
+        <!-- Stats -->
+        <tr class="stats-row">
+            <td class="stats-cell">
+                <div class="stats-title">
+                    {len(toutes_alertes)} alerte(s) active(s)
+                </div>
+                <table class="stats-table" cellpadding="0" cellspacing="2">
+                    <tr>
+                        <td class="stat-cell">
+                            <span class="stat-number">{len(alertes_par_type["ouvertures"])}</span>
+                            <div class="stat-label">Ouvertures</div>
+                        </td>
+                        <td class="stat-cell">
+                            <span class="stat-number">{len(alertes_par_type["batteries"])}</span>
+                            <div class="stat-label">Batteries</div>
+                        </td>
+                        <td class="stat-cell">
+                            <span class="stat-number">{len(alertes_par_type["installation"])}</span>
+                            <div class="stat-label">Mal installés</div>
+                        </td>
+                        <td class="stat-cell">
+                            <span class="stat-number">{len(alertes_par_type["silencieux"])}</span>
+                            <div class="stat-label">Silencieux</div>
+                        </td>
+                        <td class="stat-cell">
+                            <span class="stat-number">{len(alertes_par_type["actifs_sans_donnees"])}</span>
+                            <div class="stat-label">Actifs s/data</div>
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+        
+        <!-- Content -->
+        <tr>
+            <td class="content-cell">
+"""
+        
+        if not toutes_alertes:
+            body_html += """
+                <div class="no-alerts">
+                    <div class="no-alerts-icon">✅</div>
+                    <div class="no-alerts-title">Aucune alerte active</div>
+                    <div>Tous les capteurs fonctionnent normalement</div>
+                </div>
+"""
+        else:
+            # Section ouvertures
+            if alertes_par_type["ouvertures"]:
+                body_html += """
+                <div class="section">
+                    <div class="section-header">
+                        🚨 OUVERTURES DÉTECTÉES
+                    </div>
+"""
+                for alerte in alertes_par_type["ouvertures"]:
+                    date_str = self._format_date(alerte.get('lastUplinkTime'))
+                    body_html += f"""
+                    <div class="alerte-item">
+                        <div class="device-name">{alerte['code']} - {alerte['title']}</div>
+                        <div class="device-info">
+                            <span class="device-type">{alerte['type_capteur']}</span>
+                            <span style="font-size: 11px; color: #6b7280;">{date_str}</span>
+                        </div>
+                    </div>
+"""
+                body_html += """
+                </div>
+"""
+            
+            # Section batteries
+            if alertes_par_type["batteries"]:
+                body_html += """
+                <div class="section">
+                    <div class="section-header">
+                        🔋 BATTERIES FAIBLES
+                    </div>
+"""
+                for alerte in alertes_par_type["batteries"]:
+                    date_str = self._format_date(alerte.get('lastUplinkTime'))
+                    batterie = alerte.get('batteryPercentage', 'N/A')
+                    body_html += f"""
+                    <div class="alerte-item alerte-batterie">
+                        <div class="device-name">{alerte['code']} - {alerte['title']}</div>
+                        <div class="device-info">
+                            <span class="device-type">{alerte['type_capteur']} - {batterie}%</span>
+                            <span style="font-size: 11px; color: #6b7280;">{date_str}</span>
+                        </div>
+                    </div>
+"""
+                body_html += """
+                </div>
+"""
+            
+            # Section mal installés
+            if alertes_par_type["installation"]:
+                body_html += """
+                <div class="section">
+                    <div class="section-header">
+                        ⚠️ CAPTEURS MAL INSTALLÉS
+                    </div>
+"""
+                for alerte in alertes_par_type["installation"]:
+                    date_str = self._format_date(alerte.get('lastUplinkTime'))
+                    body_html += f"""
+                    <div class="alerte-item alerte-installation">
+                        <div class="device-name">{alerte['code']} - {alerte['title']}</div>
+                        <div class="device-info">
+                            <span class="device-type">{alerte['type_capteur']}</span>
+                            <span style="font-size: 11px; color: #6b7280;">{date_str}</span>
+                        </div>
+                    </div>
+"""
+                body_html += """
+                </div>
+"""
+            
+            # Section silencieux
+            if alertes_par_type["silencieux"]:
+                body_html += """
+                <div class="section">
+                    <div class="section-header">
+                        📡 CAPTEURS SILENCIEUX (+30 jours)
+                    </div>
+"""
+                for alerte in alertes_par_type["silencieux"]:
+                    date_str = self._format_date(alerte.get('lastUplinkTime'))
+                    body_html += f"""
+                    <div class="alerte-item alerte-silencieux">
+                        <div class="device-name">{alerte['code']} - {alerte['title']}</div>
+                        <div class="device-info">
+                            <span class="device-type">{alerte['type_capteur']}</span>
+                            <span style="font-size: 11px; color: #6b7280;">{date_str}</span>
+                        </div>
+                    </div>
+"""
+                body_html += """
+                </div>
+"""
+            
+            # Section actifs sans données
+            if alertes_par_type["actifs_sans_donnees"]:
+                body_html += """
+                <div class="section">
+                    <div class="section-header">
+                        🔄 CAPTEURS ACTIFS SANS DONNÉES
+                    </div>
+"""
+                for alerte in alertes_par_type["actifs_sans_donnees"]:
+                    date_str = self._format_date(alerte.get('lastUplinkTime'))
+                    body_html += f"""
+                    <div class="alerte-item alerte-actif">
+                        <div class="device-name">{alerte['code']} - {alerte['title']}</div>
+                        <div class="device-info">
+                            <span class="device-type">{alerte['type_capteur']}</span>
+                            <span style="font-size: 11px; color: #6b7280;">{date_str}</span>
+                        </div>
+                    </div>
+"""
+                body_html += """
+                </div>
+"""
+        
+        body_html += f"""
+            </td>
+        </tr>
+        
+        <!-- Footer -->
+        <tr class="footer-row">
+            <td class="footer-cell">
+                <strong>ℹ️</strong> Rapport automatique 16h10 | <em>{SCRIPT_NAME} - St Musse</em>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>
+"""
+        
+        msg.attach(MIMEText(body_html, "html"))
+        
+        return self._send_email(msg, "rapport complet des alertes")
+    
+    def _format_date(self, date_value):
+        """Formate une date pour l'affichage"""
+        if not date_value:
+            return "Non disponible"
+        
+        try:
+            if isinstance(date_value, (int, float)):
+                date_obj = datetime.datetime.fromtimestamp(date_value / 1000)
+            else:
+                date_obj = datetime.datetime.fromisoformat(str(date_value).replace('Z', '+00:00'))
+            return date_obj.strftime('%d/%m/%Y à %H:%M')
+        except:
+            return str(date_value)
+    
+    def _send_email(self, msg, type_email):
+        """Envoie un email avec gestion d'erreur"""
+        try:
+            context = ssl.create_default_context()
+            with smtplib.SMTP(self.config['server'], self.config['port']) as server:
+                server.starttls(context=context)
+                server.login(self.config['sender'], self.config['password'])
+                server.send_message(msg)
+                log.info(f"Email '{type_email}' envoyé avec succès à {', '.join(self.config['recipients'])}")
+                return True
+        except Exception as e:
+            log.error(f"Erreur lors de l'envoi de l'email '{type_email}': {str(e)}")
+            return False
+
+class ArcgisHelper:
+    """Classe pour interagir avec ArcGIS avec support des IDs"""
+    
+    def __init__(self):
+        self.gis = GIS("home")
+    
+    def getFeatureLayerById(self, layer_id):
+        """Récupère une couche par son ID"""
+        try:
+            log.info(f"Recherche de la couche par ID: {layer_id}")
+            item = self.gis.content.get(layer_id)
+            if item:
+                log.info(f"Couche trouvée: {item.title}")
+                return item.layers[0]
+            else:
+                log.warning(f"Couche avec ID {layer_id} non trouvée")
+                return None
+        except Exception as e:
+            log.error(f"Erreur lors de la récupération de la couche {layer_id}: {str(e)}")
+            return None
+    
+    def get_all_features(self, layer):
+        """Récupère toutes les entités d'une couche sans filtrage sur 'alerte'"""
+        try:
+            # Récupérer toutes les entités (sans filtrage sur alerte)
+            results = layer.query(
+                where="1=1",  # Requête qui récupère tout
+                out_fields="*",
+                return_geometry=False
+            )
+            
+            log.info(f"Récupéré {len(results.features)} entité(s) au total")
+            return results.features
+        except Exception as e:
+            log.error(f"Erreur lors de la récupération des entités: {str(e)}")
+            return []
+
+    def get_alertes_ouvertures(self, layer):
+        """Récupère les alertes d'ouvertures uniquement en filtrant localement"""
+        try:
+            # Récupérer toutes les entités
+            all_features = self.get_all_features(layer)
+            
+            # Filtrer localement pour trouver les alertes d'ouverture
+            alertes_ouvertures = []
+            for feature in all_features:
+                attrs = feature.attributes
+                
+                # Vérifier si c'est une alerte
+                is_alerte = False
+                alerte_value = attrs.get("alerte")
+                
+                # Gérer les différents types possibles pour alerte
+                if isinstance(alerte_value, str):
+                    is_alerte = (alerte_value.lower() == 'true')
+                elif isinstance(alerte_value, bool):
+                    is_alerte = alerte_value
+                elif isinstance(alerte_value, (int, float)):
+                    is_alerte = (alerte_value == 1)
+                
+                # Vérifier si c'est une alerte d'ouverture
+                alerte_type = attrs.get("alerte_type", "")
+                is_ouverture = False
+                if alerte_type:
+                    if "fenetre_ouverte_hors_horaire" in alerte_type or "porte_ouverte_hors_horaire" in alerte_type:
+                        is_ouverture = True
+                
+                # Ajouter à la liste si c'est une alerte d'ouverture
+                if is_alerte and is_ouverture:
+                    alertes_ouvertures.append(feature)
+            
+            log.info(f"Filtré {len(alertes_ouvertures)} alerte(s) d'ouverture")
+            return alertes_ouvertures
+        except Exception as e:
+            log.error(f"Erreur lors du filtrage des alertes d'ouverture: {str(e)}")
+            return []
+
+    def get_toutes_alertes(self, layer):
+        """Récupère toutes les alertes actives en filtrant localement"""
+        try:
+            # Récupérer toutes les entités
+            all_features = self.get_all_features(layer)
+            
+            # Filtrer localement pour trouver les alertes
+            alertes_actives = []
+            for feature in all_features:
+                attrs = feature.attributes
+                
+                # Vérifier si c'est une alerte
+                is_alerte = False
+                alerte_value = attrs.get("alerte")
+                
+                # Gérer les différents types possibles pour alerte
+                if isinstance(alerte_value, str):
+                    is_alerte = (alerte_value.lower() == 'true')
+                elif isinstance(alerte_value, bool):
+                    is_alerte = alerte_value
+                elif isinstance(alerte_value, (int, float)):
+                    is_alerte = (alerte_value == 1)
+                
+                # Ajouter à la liste si c'est une alerte
+                if is_alerte:
+                    alertes_actives.append(feature)
+            
+            log.info(f"Filtré {len(alertes_actives)} alerte(s) active(s)")
+            return alertes_actives
+        except Exception as e:
+            log.error(f"Erreur lors du filtrage des alertes actives: {str(e)}")
+            return []
+
+class SuiviManager:
+    """Gère le suivi des emails envoyés pour éviter les doublons"""
+    
+    def __init__(self, suivi_file=SUIVI_FILE):
+        self.suivi_file = suivi_file
+    
+    def load_suivi(self):
+        """Charge le fichier de suivi"""
+        try:
+            if os.path.exists(self.suivi_file):
+                with open(self.suivi_file, 'r') as f:
+                    return json.load(f)
+        except Exception as e:
+            log.warning(f"Erreur lecture fichier suivi: {str(e)}")
+        return {}
+    
+    def save_suivi(self, suivi_data):
+        """Sauvegarde le fichier de suivi"""
+        try:
+            with open(self.suivi_file, 'w') as f:
+                json.dump(suivi_data, f, indent=2, default=str)
+        except Exception as e:
+            log.error(f"Erreur sauvegarde fichier suivi: {str(e)}")
+    
+    def should_send_email(self, email_type):
+        """Détermine si un email doit être envoyé (évite les doublons)"""
+        suivi = self.load_suivi()
+        today = datetime.datetime.now().strftime('%Y-%m-%d')
+        
+        key = f"{today}_{email_type}"
+        return key not in suivi
+    
+    def mark_email_sent(self, email_type):
+        """Marque un email comme envoyé"""
+        suivi = self.load_suivi()
+        today = datetime.datetime.now().strftime('%Y-%m-%d')
+        
+        key = f"{today}_{email_type}"
+        suivi[key] = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "type": email_type
+        }
+        
+        # Nettoyer les anciennes entrées (plus de 7 jours)
+        cutoff_date = datetime.datetime.now() - datetime.timedelta(days=7)
+        keys_to_remove = []
+        for k in suivi.keys():
+            try:
+                date_str = k.split('_')[0]
+                date_obj = datetime.datetime.strptime(date_str, '%Y-%m-%d')
+                if date_obj < cutoff_date:
+                    keys_to_remove.append(k)
+            except:
+                pass
+        
+        for k in keys_to_remove:
+            del suivi[k]
+        
+        self.save_suivi(suivi)
+
+# ==================== FONCTIONS PRINCIPALES ====================
+
+def process_couche_alertes(arcgis_helper, couche_config, type_email):
+    """Traite une couche pour récupérer les alertes"""
+    
+    layer_id = couche_config["layer_id"]
+    type_display = couche_config["type_display"]
+    
+    # Récupération de la couche PAR ID
+    layer = arcgis_helper.getFeatureLayerById(layer_id)
+    if not layer:
+        log.error(f"Couche {layer_id} introuvable")
+        return []
+    
+    # Récupération des alertes selon le type d'email
+    if type_email == "ouvertures":
+        features = arcgis_helper.get_alertes_ouvertures(layer)
+    else:  # toutes_alertes
+        features = arcgis_helper.get_toutes_alertes(layer)
+    
+    # Conversion en format exploitable
+    alertes = []
+    for feature in features:
+        attrs = feature.attributes
+        alerte_data = {
+            "code": attrs.get("code"),
+            "title": attrs.get("title", attrs.get("servicePoint_description", "Nom non disponible")),
+            "type_capteur": type_display,
+            "alerte_type": attrs.get("alerte_type"),
+            "lastUplinkTime": attrs.get("lastUplinkTime"),
+            "batteryPercentage": attrs.get("batteryPercentage"),
+            "state": attrs.get("state"),
+            "count_alerte": attrs.get("count_alerte", 0)
+        }
+        alertes.append(alerte_data)
+    
+    return alertes
+
+def check_and_send_emails():
+    """Fonction principale de vérification et d'envoi des emails"""
+    
+    now = datetime.datetime.now()
+    current_hour = now.hour
+    current_minute = now.minute
+    
+    # 🧪 MODE SIMULATION : Force l'envoi immédiat
+    if SIMULATION_MODE:
+        log.info("MODE SIMULATION ACTIVE - Envoi forcé des emails de test COMPATIBLES OUTLOOK")
+        # Force les conditions pour déclencher les emails
+        current_hour = HORAIRE_EMAIL_OUVERTURES
+        current_minute = 0
+        # Note: Le suivi sera ignoré en mode simulation pour permettre les tests multiples
+    
+    log.info(f"Vérification horaire: {now.hour:02d}:{now.minute:02d} (Mode simulation: {SIMULATION_MODE})")
+    
+    # Initialisation des managers
+    arcgis_helper = ArcgisHelper()
+    email_manager = EmailManager()
+    suivi_manager = SuiviManager()
+    
+    emails_sent = 0
+    
+    # EMAIL 1: Alertes d'ouvertures à 16h00 (ou immédiatement en simulation)
+    if current_hour == HORAIRE_EMAIL_OUVERTURES and current_minute == 0:
+        if SIMULATION_MODE or suivi_manager.should_send_email("ouvertures"):
+            log.info("=== ENVOI EMAIL ALERTES OUVERTURES (16h00) - VERSION OUTLOOK ===")
+            
+            # Récupération des alertes d'ouvertures des deux couches
+            all_alertes_ouvertures = []
+            for couche_key, couche_config in COUCHES_CONFIG.items():
+                alertes = process_couche_alertes(arcgis_helper, couche_config, "ouvertures")
+                all_alertes_ouvertures.extend(alertes)
+            
+            # Envoi de l'email
+            if email_manager.send_ouvertures_alert(all_alertes_ouvertures):
+                if not SIMULATION_MODE:  # Marquer comme envoyé seulement en production
+                    suivi_manager.mark_email_sent("ouvertures")
+                emails_sent += 1
+                log.info(f"Email alertes ouvertures envoyé (VERSION OUTLOOK): {len(all_alertes_ouvertures)} alerte(s)")
+            else:
+                log.error("Échec envoi email alertes ouvertures")
+        else:
+            log.info("Email alertes ouvertures déjà envoyé aujourd'hui")
+    
+    # EMAIL 2: Toutes les alertes à 16h10 (ou 5 secondes après en simulation)
+    simulation_condition = SIMULATION_MODE  # En simulation, envoie immédiatement aussi
+    time_condition = (current_hour == HORAIRE_EMAIL_TOUTES_ALERTES and current_minute == MINUTE_EMAIL_TOUTES_ALERTES)
+    
+    if simulation_condition or time_condition:
+        if SIMULATION_MODE or suivi_manager.should_send_email("toutes_alertes"):
+            if SIMULATION_MODE:
+                log.info("Attente de 5 secondes avant envoi du rapport complet...")
+                time.sleep(5)  # Petite pause en simulation pour voir les 2 emails séparément
+            
+            log.info("=== ENVOI EMAIL TOUTES ALERTES (16h10) - VERSION OUTLOOK ===")
+            
+            # Récupération de toutes les alertes des deux couches
+            all_toutes_alertes = []
+            for couche_key, couche_config in COUCHES_CONFIG.items():
+                alertes = process_couche_alertes(arcgis_helper, couche_config, "toutes_alertes")
+                all_toutes_alertes.extend(alertes)
+            
+            # Envoi de l'email
+            if email_manager.send_toutes_alertes(all_toutes_alertes):
+                if not SIMULATION_MODE:  # Marquer comme envoyé seulement en production
+                    suivi_manager.mark_email_sent("toutes_alertes")
+                emails_sent += 1
+                log.info(f"Email toutes alertes envoyé (VERSION OUTLOOK): {len(all_toutes_alertes)} alerte(s)")
+            else:
+                log.error("Échec envoi email toutes alertes")
+        else:
+            log.info("Email toutes alertes déjà envoyé aujourd'hui")
+    
+    return emails_sent
+
+def main():
+    """Fonction principale"""
+    
+    log.info("====== DÉMARRAGE SURVEILLANCE CAPTEURS AVEC EMAILS COMPATIBLES OUTLOOK (IDS) ======")
+    start_time = time.time()
+    
+    try:
+        # Test de la connexion email au démarrage
+        email_manager = EmailManager()
+        if not email_manager.test_connection():
+            log.error("Test de connexion email échoué")
+            return 1
+        
+        log.info("Test de connexion email réussi")
+        
+        # Vérification et envoi des emails selon l'horaire
+        emails_sent = check_and_send_emails()
+        
+        elapsed_time = time.time() - start_time
+        log.info(f"====== FIN SURVEILLANCE - {emails_sent} email(s) envoyé(s) en {elapsed_time:.1f}s ======")
+        
+        return 0
+        
+    except Exception as e:
+        log.exception(f"Erreur critique: {str(e)}")
+        return 1
+
+if __name__ == "__main__":
+    try:
+        exit_code = main()
+        sys.exit(exit_code)
+    except Exception as e:
+        log.critical(f"Erreur non gérée: {str(e)}")
+        sys.exit(1)
