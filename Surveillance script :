@@ -1,0 +1,607 @@
+# Script unifié de gestion des capteurs - Amir
+# Gestion WS301 (fenêtres) ET ACS-Switch (portes extérieures)
+
+import json, logging, datetime, sys, os, copy, arcgis, time, requests, pytz
+from dateutil.relativedelta import relativedelta
+
+# ==================== CONFIGURATION ====================
+SCRIPT_NAME = "amir_capteurs_unified_management"
+
+config = {
+    "urlGroup" : ,
+    "urlDevices": 
+    "urlDatas": 
+    "headers": {
+        "X-API-KEY":
+    },
+    "group_code" : "",
+    
+    # CONFIGURATION DES DEUX COUCHES
+    "capteurs_config": {
+        "WS301": {
+            "device_types": 
+            "feature_layer_id": "",
+            "type_display": "fenêtres"
+        },
+        "PORTES": {
+            "device_types": 
+            "feature_layer_id": "",
+            "type_display": "portes"
+        }
+    }
+}
+
+# Timezone française pour les alertes
+TIME_ZONE = pytz.timezone('Europe/Paris') 
+HEURE_FERMETURE = 16  # 16h00 = fermeture du bâtiment
+BATTERIE_SEUIL_ALERTE = 15  # Seuil d'alerte batterie faible (en %)
+UTC_OFFSET_TIMEDELTA = datetime.datetime.utcnow() - datetime.datetime.now()
+
+# ==================== HELPERS ====================
+
+def getSingleConfig(confKey):
+    with open('config.json') as f:
+        configs = json.load(f)
+    config = configs[confKey] if confKey in configs else None
+    return config
+
+def getRequestWithRetry(url, headers, nbRetry=3, waitTime=0.2):
+    responseCorrect = None
+    for att in range(nbRetry):
+        try:
+            response = requests.request("GET", url, headers=headers)
+            if response.status_code == 200:
+                responseJson = json.loads(response.text)
+                if "code" in responseJson:
+                    raise Exception("bad response: " + str(responseJson["code"]))
+                responseCorrect = responseJson
+                break
+            else:
+                raise Exception("bad code : " + str(response.status_code))
+        except Exception as e:
+            logging.debug(f"{url} attempt {att}: {e}")
+            time.sleep(waitTime)
+
+    if responseCorrect is not None:             
+        return responseCorrect
+    else: 
+        raise Exception("No response for : " + url)
+
+def filterDevicesByType(devices, device_types):
+    """Filtre les devices selon les types demandés"""
+    devices_filtered = [device for device in devices if 
+                       device["status"] in ['Activated'] and
+                       device["deviceType"]["name"] in device_types and
+                       'location' in device['servicePoint'] and 
+                       'lon' in device['servicePoint']['location'] and
+                       'servicePoint' in device and
+                       'number' in device["servicePoint"]]
+    return devices_filtered
+
+# ==================== GESTION DES CAPTEURS ====================
+
+def getCapteurs(config, device_types):
+    """Récupère tous les capteurs du type demandé avec leurs données récentes"""
+    headers = config["headers"]
+    url_devices = config["urlDevices"].format(config["group_code"])
+    
+    devices_response = getRequestWithRetry(url_devices, headers)
+    devices = devices_response[0]["devices"] if devices_response else []
+    
+    # Filtrer selon les types demandés
+    devices_filtered = filterDevicesByType(devices, device_types)
+    
+    # Récupérer les données récentes pour chaque capteur
+    date_fin = datetime.datetime.now()
+    date_debut = date_fin - relativedelta(days=7)  # 7 derniers jours
+    
+    for device in devices_filtered:
+        servicepoint_number = device["servicePoint"]['number']
+        
+        # VÉRIFICATION PRÉALABLE: Analyser lastUplinkTime avant de faire l'appel API
+        last_uplink_str = device.get("lastUplinkTime")
+        if last_uplink_str:
+            try:
+                # Convertir lastUplinkTime en datetime local
+                last_uplink_utc = datetime.datetime.strptime(last_uplink_str, '%Y-%m-%dT%H:%M:%SZ')
+                last_uplink_utc = pytz.utc.localize(last_uplink_utc)
+                last_uplink_local = last_uplink_utc.astimezone(TIME_ZONE).replace(tzinfo=None)
+                
+                # Calculer l'ancienneté
+                now = datetime.datetime.now()
+                days_since_last_uplink = (now - last_uplink_local).days
+                
+                if days_since_last_uplink > 30:
+                    # Capteur silencieux depuis plus d'1 mois : pas la peine de chercher des données récentes
+                    device["datas"] = []
+                    device["is_silent"] = True
+                    device["days_silent"] = days_since_last_uplink
+                    continue
+            except Exception as e:
+                logging.debug(f"Erreur analyse lastUplinkTime pour {servicepoint_number}: {e}")
+        
+        # Formater les dates pour l'API (UTC) - seulement si le capteur est potentiellement actif
+        date_debut_str = (date_debut + UTC_OFFSET_TIMEDELTA).isoformat(timespec='auto')
+        date_fin_str = (date_fin + UTC_OFFSET_TIMEDELTA).isoformat(timespec='auto')
+        
+        # Récupérer les données du capteur
+        url_datas = config["urlDatas"].format(servicepoint_number, date_debut_str, date_fin_str)
+        
+        try:
+            device_datas = getRequestWithRetry(url_datas, headers)
+            device["datas"] = device_datas
+            device["is_silent"] = False
+        except Exception as e:
+            logging.debug(f"Erreur récupération données {servicepoint_number}: {e}")
+            device["datas"] = []
+            device["is_silent"] = False
+    
+    return devices_filtered
+
+def extractLastDataFromDevice(device):
+    """Extrait les dernières données d'un capteur (WS301 ou Portes)"""
+    
+    # Vérifier si le capteur est marqué comme silencieux
+    if device.get("is_silent", False):
+        return None, None, None, None, None
+    
+    if not device.get("datas") or len(device["datas"]) == 0:
+        return None, None, None, None, None
+    
+    # Trier les données par date (plus récent en dernier)
+    datas_sorted = sorted(device["datas"], key=lambda x: x["dateTime"])
+    
+    # Dernière date des données (pour lastUplinkTime)
+    last_datetime_str = datas_sorted[-1]["dateTime"]
+    
+    # CONVERSION UTC → HEURE LOCALE FRANÇAISE pour lastUplinkTime
+    last_datetime_utc = datetime.datetime.strptime(last_datetime_str, '%Y-%m-%dT%H:%M:%SZ')
+    last_datetime_utc = pytz.utc.localize(last_datetime_utc)
+    last_datetime_local = last_datetime_utc.astimezone(TIME_ZONE)
+    
+    # Supprimer le timezone pour ArcGIS (garde juste l'heure locale)
+    last_datetime = last_datetime_local.replace(tzinfo=None)
+    
+    # Chercher les dernières valeurs de state, battery et install
+    last_state = None
+    last_battery = None
+    last_install = None
+    
+    # Parcourir de la fin vers le début pour trouver les dernières valeurs
+    for data_entry in reversed(datas_sorted):
+        data = data_entry["data"]
+        
+        if last_state is None and "state" in data:
+            last_state = data["state"]
+            
+        if last_battery is None and "battery" in data:
+            raw_battery = data["battery"]
+            # CONVERSION BATTERIE: Si 1 alors 100%, sinon garder la valeur
+            last_battery = 100 if raw_battery == 1 else raw_battery
+            
+        if last_install is None and "install" in data:
+            last_install = data["install"]
+            
+        # Si on a tout, on peut s'arrêter
+        if last_state is not None and last_battery is not None and last_install is not None:
+            break
+    
+    return last_datetime, last_state, last_battery, last_datetime_str, last_install
+
+def analyzeDeviceState(device_datas, capteur_type):
+    """Analyse l'état des capteurs pour détecter les ouvertures hors horaire"""
+    if not device_datas:
+        return None, None, False
+    
+    # Trier les données par date
+    datas_sorted = sorted(device_datas, key=lambda x: x["dateTime"])
+    
+    # Heure actuelle
+    now_local = datetime.datetime.now()
+    today_16h = now_local.replace(hour=HEURE_FERMETURE, minute=0, second=0, microsecond=0)
+    
+    # Chercher l'état actuel du capteur (dernière mesure avec state)
+    current_state = None
+    current_date = None
+    
+    for data_entry in reversed(datas_sorted):
+        if "state" in data_entry["data"]:
+            current_state = data_entry["data"]["state"]
+            current_date = data_entry["dateTime"]
+            break
+    
+    if current_state is None:
+        return None, None, False
+    
+    # Convertir la date de la dernière mesure
+    date_utc = datetime.datetime.strptime(current_date, '%Y-%m-%dT%H:%M:%SZ')
+    date_utc = pytz.utc.localize(date_utc)
+    date_locale = date_utc.astimezone(TIME_ZONE).replace(tzinfo=None)
+    
+    # LOGIQUE D'ALERTE COMMUNE:
+    # Si le capteur est actuellement ouvert (state=1) ET qu'on est après 16h
+    if current_state == 1 and now_local >= today_16h:
+        return current_state, current_date, True
+    
+    return current_state, current_date, False
+
+def calculateAlerte(state, date_mesure_str, battery_percentage, install_status, device, capteur_type):
+    """Calcule si une alerte doit être déclenchée - SANS créer de timestamp"""
+    alertes = []
+    
+    # 1. Vérifier d'abord si le capteur est silencieux (plus de 30 jours sans uplink)
+    if device.get("is_silent", False):
+        days_silent = device.get("days_silent", 0)
+        if days_silent > 2:
+            alertes.append("capteur_silencieux")
+    
+    # 2. LOGIQUE : Détecter les capteurs actifs mais sans données utiles
+    if not device.get("is_silent", False) and state is None:
+        last_uplink_str = device.get("lastUplinkTime")
+        if last_uplink_str:
+            try:
+                # Convertir lastUplinkTime en datetime local
+                last_uplink_utc = datetime.datetime.strptime(last_uplink_str, '%Y-%m-%dT%H:%M:%SZ')
+                last_uplink_utc = pytz.utc.localize(last_uplink_utc)
+                last_uplink_local = last_uplink_utc.astimezone(TIME_ZONE).replace(tzinfo=None)
+                
+                # Calculer l'ancienneté
+                now = datetime.datetime.now()
+                hours_since_last_uplink = (now - last_uplink_local).total_seconds() / 3600
+                
+                # Si le capteur a communiqué dans les dernières 48h mais n'a pas de state
+                if hours_since_last_uplink <= 48:
+                    alertes.append("capteur_actif_sans_donnees")
+                    logging.info(f"Capteur {capteur_type} {device['servicePoint']['number']} actif mais sans données (dernier uplink: {hours_since_last_uplink:.1f}h)")
+                
+            except Exception as e:
+                logging.debug(f"Erreur analyse lastUplinkTime pour capteur actif sans données: {e}")
+    
+    # 3. Analyser l'état des capteurs (fenêtres/portes)
+    if state is not None and device.get("datas"):
+        current_state, last_date, is_alert = analyzeDeviceState(device["datas"], capteur_type)
+        if is_alert:
+            if capteur_type == "WS301":
+                alertes.append("fenetre_ouverte_hors_horaire")
+            else:  # Portes
+                alertes.append("porte_ouverte_hors_horaire")
+    
+    # 4. Alerte batterie faible (pour WS301 ET portes maintenant)
+    if battery_percentage is not None and battery_percentage <= BATTERIE_SEUIL_ALERTE:
+        alertes.append("batterie_faible")
+    
+    # 5. Alerte capteur mal installé (SEULEMENT pour WS301)
+    if capteur_type == "WS301" and install_status == 1:
+        alertes.append("capteur_mal_installe")
+    
+    # Retourner le résultat - SANS timestamp
+    if alertes:
+        alerte_type = "|".join(alertes)
+        return True, alerte_type  # ✅ PLUS DE TIMESTAMP ICI
+    else:
+        return False, None
+
+def convertDeviceToFeature(device, execution_time, capteur_type):
+    """Convertit un device API en Feature ArcGIS"""
+    
+    # Extraction des données
+    last_uplink_time, state, battery, date_mesure_str, install_status = extractLastDataFromDevice(device)
+    
+    # Date d'import = heure d'exécution du script
+    if execution_time.tzinfo is None:
+        execution_time_france = TIME_ZONE.localize(execution_time)
+    else:
+        execution_time_france = execution_time.astimezone(TIME_ZONE)
+    
+    # Supprimer le timezone pour ArcGIS
+    date_import = execution_time_france.replace(tzinfo=None)
+    
+    if last_uplink_time is None:
+        # Créer un Feature avec des valeurs par défaut si pas de données récentes
+        alerte, alerte_type = calculateAlerte(None, None, None, None, device, capteur_type)  # ✅ PLUS DE TIMESTAMP
+        
+        # Conversion batterie du device (POUR TOUS LES TYPES)
+        device_battery = device.get("batteryPercentage")
+        if device_battery == 1:
+            device_battery = 100
+        elif device_battery is not None and device_battery < 1:
+            device_battery = round(device_battery * 100)
+        
+        attributes = {
+            "id": device["id"],
+            "code": device["servicePoint"]["number"], 
+            "title": device["servicePoint"]["description"],
+            "deviceType_name": device["deviceType"]["name"],
+            "servicePoint_description": device["servicePoint"]["description"],
+            "servicePoint_location_lat": device["servicePoint"]["location"]["lat"],
+            "servicePoint_location_lon": device["servicePoint"]["location"]["lon"], 
+            "servicePoint_location_alt": device["servicePoint"]["location"]["alt"],
+            "brand": device["brand"],
+            "status": device["status"],
+            "groups": device["groups"][0]["title"] if device["groups"] else None,
+            "operator": device["operator"],
+            "lastUplinkTime": datetime.datetime.strptime(device["lastUplinkTime"], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=pytz.utc).astimezone(TIME_ZONE).replace(tzinfo=None) if device["lastUplinkTime"] else None,
+            "date_import": date_import,
+            "state": None,
+            "alerte": alerte,
+            "alerte_type": alerte_type,
+            "timestamp_alerte": None,  # ✅ SERA GÉRÉ DANS updateOrInsertCapteur
+            "batteryPercentage": device_battery
+        }
+    else:
+        # Calcul des alertes
+        alerte, alerte_type = calculateAlerte(state, date_mesure_str, battery, install_status, device, capteur_type)  # ✅ PLUS DE TIMESTAMP
+        
+        # Pour les portes ET les fenêtres, garder la batterie si elle existe
+        # Si pas de batterie dans les datas, utiliser celle du device
+        if battery is not None:
+            final_battery = battery
+        else:
+            # Fallback sur batteryPercentage du device
+            device_battery_fallback = device.get("batteryPercentage")
+            if device_battery_fallback == 1:
+                final_battery = 100
+            elif device_battery_fallback is not None and device_battery_fallback < 1:
+                final_battery = round(device_battery_fallback * 100)
+            else:
+                final_battery = device_battery_fallback
+        
+        # Construction des attributs avec données
+        attributes = {
+            "id": device["id"],
+            "code": device["servicePoint"]["number"], 
+            "title": device["servicePoint"]["description"],
+            "deviceType_name": device["deviceType"]["name"],
+            "servicePoint_description": device["servicePoint"]["description"],
+            "servicePoint_location_lat": device["servicePoint"]["location"]["lat"],
+            "servicePoint_location_lon": device["servicePoint"]["location"]["lon"], 
+            "servicePoint_location_alt": device["servicePoint"]["location"]["alt"],
+            "brand": device["brand"],
+            "status": device["status"],
+            "groups": device["groups"][0]["title"] if device["groups"] else None,
+            "operator": device["operator"],
+            "lastUplinkTime": last_uplink_time,
+            "date_import": date_import,
+            "state": state,
+            "alerte": alerte,
+            "alerte_type": alerte_type,
+            "timestamp_alerte": None,  # ✅ SERA GÉRÉ DANS updateOrInsertCapteur
+            "batteryPercentage": final_battery
+        }
+    
+    # Construction de la géométrie
+    geometry = arcgis.geometry.Point({
+        "x": device["servicePoint"]["location"]["lon"],
+        "y": device["servicePoint"]["location"]["lat"], 
+        "z": device["servicePoint"]["location"]["alt"],
+        "spatialReference": {"wkid": 4326}
+    })
+    
+    return arcgis.features.Feature.from_dict({
+        "attributes": attributes,
+        "geometry": geometry
+    })
+
+# ==================== ARCGIS HELPER ====================
+
+class ArcgisHelper:
+    def __init__(self):
+        self.gis = arcgis.gis.GIS("home")
+        
+    def getHostedFeatureLayer(self, layer_identifier):
+        # Si c'est un ID (contient des caractères hexadécimaux)
+        if len(layer_identifier) == 32 and all(c in '0123456789abcdef' for c in layer_identifier.lower()):
+            # Chercher par ID
+            item = self.gis.content.get(layer_identifier)
+            if item:
+                return item.layers[0]
+            else:
+                raise Exception(f"Couche avec ID {layer_identifier} non trouvée")
+        else:
+            # Chercher par nom (ancien comportement)
+            search_result = self.gis.content.search(query=layer_identifier, item_type="Feature Layer")
+            if search_result:
+                return search_result[0].layers[0]
+            else:
+                raise Exception(f"Couche {layer_identifier} non trouvée")
+    
+    def updateOrInsertCapteur(self, feature_layer, new_feature, id_field="code"):
+        """Met à jour un capteur s'il existe, sinon l'insère"""
+        
+        try:
+            # Chercher si le capteur existe déjà
+            where_clause = f"{id_field}='{new_feature.attributes[id_field]}'"
+            existing_features = feature_layer.query(where_clause, return_geometry=False)
+            
+            if existing_features.features and len(existing_features.features) > 0:
+                # UPDATE : capteur existe
+                existing_feature = existing_features.features[0]
+                
+                # ✅ LOGIQUE COMPLÈTE COMPTEUR + TIMESTAMP
+                old_alerte = existing_feature.attributes.get("alerte", False)
+                new_alerte = new_feature.attributes.get("alerte", False)
+                old_count = existing_feature.attributes.get("count_alerte", 0)
+                old_timestamp = existing_feature.attributes.get("timestamp_alerte")
+                old_alerte_type = existing_feature.attributes.get("alerte_type", "")
+                new_alerte_type = new_feature.attributes.get("alerte_type", "")
+                
+                # 🔍 DEBUG LOG POUR COMPRENDRE LE PROBLÈME
+                logging.debug(f"CAPTEUR {new_feature.attributes[id_field]}: old_alerte={old_alerte} ({old_alerte_type}) → new_alerte={new_alerte} ({new_alerte_type})")
+                
+                if new_alerte and not old_alerte:
+                    # NOUVELLE ALERTE : +1 + nouvelle timestamp
+                    new_feature.attributes["count_alerte"] = old_count + 1
+                    new_feature.attributes["timestamp_alerte"] = datetime.datetime.now()
+                    logging.info(f"Nouvelle alerte {new_feature.attributes[id_field]} (count: {old_count + 1})")
+                    
+                elif new_alerte and old_alerte:
+                    # ALERTE CONTINUE : même count + ancienne timestamp (PAS DE DUPE)
+                    new_feature.attributes["count_alerte"] = old_count
+                    new_feature.attributes["timestamp_alerte"] = old_timestamp
+                    
+                else:
+                    # PAS D'ALERTE : garder count + pas de timestamp
+                    new_feature.attributes["count_alerte"] = old_count
+                    new_feature.attributes["timestamp_alerte"] = None
+                
+                # Copier l'OBJECTID pour l'update
+                objectid_field = None
+                for field_name in ["OBJECTID", "objectid", "OID", "FID"]:
+                    if field_name in existing_feature.attributes:
+                        objectid_field = field_name
+                        break
+                
+                if objectid_field:
+                    new_feature.attributes[objectid_field] = existing_feature.attributes[objectid_field]
+                    
+                    # Mettre à jour
+                    result = feature_layer.edit_features(updates=[new_feature])
+                    if not (result.get("updateResults") and result["updateResults"][0]["success"]):
+                        logging.error(f"Erreur update {new_feature.attributes[id_field]}")
+                else:
+                    logging.error(f"OBJECTID introuvable pour {new_feature.attributes[id_field]}")
+                    
+            else:
+                # INSERT : nouveau capteur
+                if new_feature.attributes.get("alerte", False):
+                    new_feature.attributes["count_alerte"] = 1
+                    new_feature.attributes["timestamp_alerte"] = datetime.datetime.now()
+                else:
+                    new_feature.attributes["count_alerte"] = 0
+                    new_feature.attributes["timestamp_alerte"] = None
+                
+                # Supprimer les champs OBJECTID/FID avant l'insertion
+                for field_to_remove in ["OBJECTID", "objectid", "OID", "FID"]:
+                    if field_to_remove in new_feature.attributes:
+                        del new_feature.attributes[field_to_remove]
+                
+                result = feature_layer.edit_features(adds=[new_feature])
+                if not (result.get("addResults") and result["addResults"][0]["success"]):
+                    logging.error(f"Erreur insert {new_feature.attributes[id_field]}")
+                    
+        except Exception as e:
+            logging.error(f"Erreur updateOrInsertCapteur pour {new_feature.attributes.get(id_field, 'UNKNOWN')}: {e}")
+            raise e
+
+# ==================== STATUT ====================
+
+class Statut:
+    def __init__(self, nom_script):
+        self.nom_script = nom_script
+        self.start_time = datetime.datetime.now()
+        
+    def log_start(self):
+        logging.info(f"Début {self.nom_script}")
+        
+    def log_end(self, nb_traites, nb_erreurs=0):
+        duration = datetime.datetime.now() - self.start_time
+        logging.info(f"Fin {self.nom_script} - {nb_traites} capteurs en {duration}")
+        if nb_erreurs > 0:
+            logging.warning(f"{nb_erreurs} erreurs")
+
+# ==================== PROGRAMME PRINCIPAL ====================
+
+def processCapteurType(capteur_key, capteur_config, arcgis_helper, execution_time):
+    """Traite un type de capteur (WS301 ou PORTES)"""
+    
+    device_types = capteur_config["device_types"]
+    feature_layer_identifier = capteur_config.get("feature_layer_id") or capteur_config.get("feature_layer_name")
+    type_display = capteur_config["type_display"]
+    
+    logging.info(f"=== TRAITEMENT {capteur_key} ({type_display}) ===")
+    
+    # Récupération des capteurs
+    devices = getCapteurs(config, device_types)
+    
+    if not devices:
+        logging.warning(f"Aucun capteur {capteur_key} trouvé")
+        return 0, 0, {}
+    
+    logging.info(f"{len(devices)} capteurs {type_display} trouvés")
+    
+    # Connexion à la couche ArcGIS
+    feature_layer = arcgis_helper.getHostedFeatureLayer(feature_layer_identifier)
+    
+    # Traitement de chaque capteur
+    nb_traites = 0
+    nb_erreurs = 0
+    nb_alertes = {"ouverture": 0, "batterie": 0, "installation": 0, "silencieux": 0, "actif_sans_donnees": 0}
+    
+    for device in devices:
+        try:
+            feature = convertDeviceToFeature(device, execution_time, capteur_key)
+            
+            if feature:
+                arcgis_helper.updateOrInsertCapteur(feature_layer, feature)
+                nb_traites += 1
+                
+                # Compter les alertes
+                if feature.attributes["alerte"]:
+                    alerte_type = feature.attributes["alerte_type"]
+                    if "fenetre_ouverte_hors_horaire" in alerte_type or "porte_ouverte_hors_horaire" in alerte_type:
+                        nb_alertes["ouverture"] += 1
+                    if "batterie_faible" in alerte_type:
+                        nb_alertes["batterie"] += 1
+                    if "capteur_mal_installe" in alerte_type:
+                        nb_alertes["installation"] += 1
+                    if "capteur_silencieux" in alerte_type:
+                        nb_alertes["silencieux"] += 1
+                    if "capteur_actif_sans_donnees" in alerte_type:
+                        nb_alertes["actif_sans_donnees"] += 1
+                    
+        except Exception as e:
+            logging.error(f"Erreur {device['servicePoint']['number']}: {e}")
+            nb_erreurs += 1
+    
+    # Résumé pour ce type
+    total_alertes = sum(nb_alertes.values())
+    if total_alertes > 0:
+        alertes_detail = f" (ouvertures:{nb_alertes['ouverture']}, batteries:{nb_alertes['batterie']}, installation:{nb_alertes['installation']}, silencieux:{nb_alertes['silencieux']}, actifs sans données:{nb_alertes['actif_sans_donnees']})"
+        logging.info(f"{total_alertes} alertes {type_display}{alertes_detail}")
+    
+    return nb_traites, nb_erreurs, nb_alertes
+
+def main():
+    # Initialisation
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')  # ✅ RETOUR EN INFO
+    
+    execution_time = datetime.datetime.now()
+    statut = Statut(SCRIPT_NAME)
+    statut.log_start()
+    
+    try:
+        # Connexion ArcGIS
+        arcgis_helper = ArcgisHelper()
+        
+        # Totaux globaux
+        total_traites = 0
+        total_erreurs = 0
+        total_alertes_global = {"ouverture": 0, "batterie": 0, "installation": 0, "silencieux": 0, "actif_sans_donnees": 0}
+        
+        # TRAITER CHAQUE TYPE DE CAPTEUR
+        for capteur_key, capteur_config in config["capteurs_config"].items():
+            nb_traites, nb_erreurs, nb_alertes = processCapteurType(
+                capteur_key, capteur_config, arcgis_helper, execution_time
+            )
+            
+            # Cumuler les totaux
+            total_traites += nb_traites
+            total_erreurs += nb_erreurs
+            for key in total_alertes_global:
+                total_alertes_global[key] += nb_alertes[key]
+        
+        # RÉSUMÉ FINAL GLOBAL
+        logging.info("=== RÉSUMÉ GLOBAL ===")
+        total_alertes = sum(total_alertes_global.values())
+        if total_alertes > 0:
+            alertes_detail = f" (ouvertures:{total_alertes_global['ouverture']}, batteries:{total_alertes_global['batterie']}, installation:{total_alertes_global['installation']}, silencieux:{total_alertes_global['silencieux']}, actifs sans données:{total_alertes_global['actif_sans_donnees']})"
+            logging.info(f"TOTAL: {total_alertes} alertes actives{alertes_detail}")
+        
+        statut.log_end(total_traites, total_erreurs)
+        
+    except Exception as e:
+        logging.error(f"Erreur critique: {e}")
+        statut.log_end(0, 1)
+
+if __name__ == "__main__":
+    main()
