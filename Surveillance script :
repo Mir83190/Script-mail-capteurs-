@@ -277,7 +277,7 @@ def calculateAlerte(state, date_mesure_str, battery_percentage, install_status, 
     # Retourner le résultat - SANS timestamp
     if alertes:
         alerte_type = "|".join(alertes)
-        return True, alerte_type  # ✅ PLUS DE TIMESTAMP ICI
+        return True, alerte_type  #  PLUS DE TIMESTAMP ICI
     else:
         return False, None
 
@@ -325,7 +325,7 @@ def convertDeviceToFeature(device, execution_time, capteur_type):
             "state": None,
             "alerte": alerte,
             "alerte_type": alerte_type,
-            "timestamp_alerte": None,  # ✅ SERA GÉRÉ DANS updateOrInsertCapteur
+            "timestamp_alerte": None,  #  SERA GÉRÉ DANS updateOrInsertCapteur
             "batteryPercentage": device_battery
         }
     else:
@@ -417,7 +417,7 @@ class ArcgisHelper:
                 # UPDATE : capteur existe
                 existing_feature = existing_features.features[0]
                 
-                # ✅ LOGIQUE COMPLÈTE COMPTEUR + TIMESTAMP
+                #  LOGIQUE COMPLÈTE COMPTEUR + TIMESTAMP
                 old_alerte = existing_feature.attributes.get("alerte", False)
                 new_alerte = new_feature.attributes.get("alerte", False)
                 old_count = existing_feature.attributes.get("count_alerte", 0)
@@ -425,7 +425,7 @@ class ArcgisHelper:
                 old_alerte_type = existing_feature.attributes.get("alerte_type", "")
                 new_alerte_type = new_feature.attributes.get("alerte_type", "")
                 
-                # 🔍 DEBUG LOG POUR COMPRENDRE LE PROBLÈME
+                #  DEBUG LOG POUR COMPRENDRE LE PROBLÈME
                 logging.debug(f"CAPTEUR {new_feature.attributes[id_field]}: old_alerte={old_alerte} ({old_alerte_type}) → new_alerte={new_alerte} ({new_alerte_type})")
                 
                 if new_alerte and not old_alerte:
