@@ -43,11 +43,11 @@ SIMULATION_MODE = True  # TODO: Mettre en commentaire ou False pour la productio
 # Configuration email (même approche robuste que Waze)
 EMAIL_CONFIG = {
     "server": "smtp.gmail.com",
-    "port": 587,
+    "port": ,
     "sender": "amirtpmstmusse@gmail.com",
-    "password": "nkyp cmmy howv dmxv",
+    "password": "   ",
     "recipients": ["amirtpmstmusse@gmail.com", "amir.labidi-ext@metropoletpm.fr",]  # Test uniquement
-    # "recipients": ["amirtpmstmusse@gmail.com", "ahuetdefrobe-ext@metropoletpm.fr", "cjoly@metropoletpm.fr"]  # PRODUCTION
+    # "recipients":  # PRODUCTION
 }
 
 # Configuration des horaires d'envoi
